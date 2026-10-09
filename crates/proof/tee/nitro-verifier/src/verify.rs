@@ -72,6 +72,29 @@ impl AttestationVerifier {
         })
     }
 
+    /// Verifies a Nitro attestation report whose certificate chain must start at
+    /// `trusted_root_der`, for callers that pin the root themselves (for example AWS's
+    /// Nitro root) instead of relying on certificates already trusted on-chain.
+    ///
+    /// [`Self::verify`] with `trustedCertsPrefixLen = 0` checks that the first certificate
+    /// is self-signed, but not which certificate it is. This entry point also requires it
+    /// to equal `trusted_root_der` byte for byte, then verifies the whole chain from it.
+    pub fn verify_with_trusted_root(
+        attestation_report: &[u8],
+        trusted_root_der: &[u8],
+    ) -> Result<VerifierJournal> {
+        let report = AttestationReport::parse(attestation_report)?;
+        if report.doc.cabundle.first().map(|root| root.as_ref()) != Some(trusted_root_der) {
+            return Err(VerifierError::CertificateVerification(
+                "root certificate is not the trusted root".into(),
+            ));
+        }
+        Self::verify(&VerifierInput {
+            trustedCertsPrefixLen: 0,
+            attestationReport: Bytes::copy_from_slice(attestation_report),
+        })
+    }
+
     /// Verifies the COSE signature over the `Sig_structure` using the leaf cert's P384 key.
     fn verify_cose_signature(
         leaf_pk_bytes: &[u8],
@@ -208,6 +231,7 @@ mod tests {
     use alloy_sol_types::SolValue;
     use rstest::{fixture, rstest};
     use serde_bytes::{ByteArray, ByteBuf};
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
@@ -282,6 +306,43 @@ mod tests {
         };
         let journal = AttestationVerifier::verify(&input).unwrap();
         assert_eq!(journal.result, VerificationResult::Success);
+    }
+
+    // ── Verification against a pinned root ──────────────────────────────
+
+    /// SHA-256 of AWS's Nitro Enclaves root certificate (G1), as AWS publishes it.
+    const AWS_NITRO_ROOT_SHA256: &str =
+        "641a0321a3e244efe456463195d606317ed7cdcc3c1756e09893f3c68f79bb5b";
+
+    fn aws_root(report: &AttestationReport) -> Vec<u8> {
+        let root = report.doc.cabundle[0].to_vec();
+        assert_eq!(hex::encode(Sha256::digest(&root)), AWS_NITRO_ROOT_SHA256);
+        root
+    }
+
+    #[rstest]
+    fn verify_with_trusted_root_accepts_the_pinned_root() {
+        let bytes = hex::decode(ATTESTATION_HEX).unwrap();
+        let root = aws_root(&AttestationReport::parse(&bytes).unwrap());
+        let journal = AttestationVerifier::verify_with_trusted_root(&bytes, &root).unwrap();
+        assert_eq!(journal.result, VerificationResult::Success);
+        assert_eq!(journal.trustedCertsPrefixLen, 0);
+        assert_eq!(journal.certs.len(), 5);
+    }
+
+    #[rstest]
+    fn verify_with_trusted_root_rejects_another_root() {
+        let bytes = hex::decode(ATTESTATION_HEX).unwrap();
+        let report = AttestationReport::parse(&bytes).unwrap();
+        let mut other = aws_root(&report);
+        let last = other.len() - 1;
+        other[last] ^= 1;
+        let err = AttestationVerifier::verify_with_trusted_root(&bytes, &other).unwrap_err();
+        assert!(err.to_string().contains("trusted root"));
+        // The regional certificate is not the root either.
+        let err = AttestationVerifier::verify_with_trusted_root(&bytes, &report.doc.cabundle[1])
+            .unwrap_err();
+        assert!(err.to_string().contains("trusted root"));
     }
 
     // ── End-to-end error tests ──────────────────────────────────────────
